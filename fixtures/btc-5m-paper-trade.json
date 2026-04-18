@@ -1,0 +1,43 @@
+{
+  "market": {
+    "market_id": "fixture-btc-5m",
+    "slug": "btc-updown-5m-fixture",
+    "interval": "5m",
+    "active": true,
+    "closed": false,
+    "seconds_to_expiry": 240,
+    "liquidity": 20000,
+    "spread": 0.02,
+    "up": {
+      "price": 0.51
+    },
+    "down": {
+      "price": 0.49
+    },
+    "reference_price": 100000.0
+  },
+  "latest_price": {
+    "price": 100060.0,
+    "volume": 120.0
+  },
+  "candles": [
+    {
+      "open": 99980.0,
+      "high": 100010.0,
+      "low": 99970.0,
+      "close": 100000.0
+    },
+    {
+      "open": 100000.0,
+      "high": 100040.0,
+      "low": 99995.0,
+      "close": 100030.0
+    },
+    {
+      "open": 100030.0,
+      "high": 100070.0,
+      "low": 100020.0,
+      "close": 100060.0
+    }
+  ]
+}
