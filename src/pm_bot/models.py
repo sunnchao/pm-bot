@@ -35,6 +35,11 @@ class MarketSnapshot:
     up: OrderBookSide
     down: OrderBookSide
     reference_price: float | None = None
+    end_date: str | None = None
+    token_id_up: str | None = None
+    token_id_down: str | None = None
+    tick_size: float | None = None
+    neg_risk: bool | None = None
 
     def midpoint_distance(self) -> float:
         return min(abs(self.up.price - 0.5), abs(self.down.price - 0.5))
@@ -65,9 +70,15 @@ class PaperTradeRecord:
     price: float
     stake: float
     signal: SignalDecision
+    expires_at: str | None = None
+    reference_price: float | None = None
     notes: list[str] = field(default_factory=list)
+    settled_at: str | None = None
+    settlement_price: float | None = None
+    outcome: str | None = None
+    pnl: float | None = None
 
     def to_dict(self) -> dict:
         payload = asdict(self)
         payload["signal"] = asdict(self.signal)
-        return payload
+        return {key: value for key, value in payload.items() if value is not None}

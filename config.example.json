@@ -10,5 +10,15 @@
   "strong_risk_pct": 0.04,
   "max_daily_drawdown_pct": 0.05,
   "cooldown_after_three_losses_minutes": 30,
-  "paper_trades_path": "data/paper_trades.jsonl"
+  "trading_mode": "paper",
+  "polymarket_host": "https://clob.polymarket.com",
+  "polygon_chain_id": 137,
+  "wallet_private_key": null,
+  "signature_type": null,
+  "funder_address": null,
+  "live_max_order_usd": 10.0,
+  "live_allow_market_ids": [],
+  "live_require_explicit_confirm": true,
+  "paper_trades_path": "data/paper_trades.jsonl",
+  "live_orders_path": "data/live_orders.jsonl"
 }

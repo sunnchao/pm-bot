@@ -7,6 +7,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 from pm_bot.clients import load_fixture_clients
+from pm_bot.config import AppConfig
 from pm_bot.service import TradingService
 
 
@@ -89,7 +90,8 @@ def _build_service(fixture: str | None) -> TradingService:
     if not fixture:
         return TradingService()
     binance, polymarket, chainlink = load_fixture_clients(Path(fixture))
-    return TradingService(binance=binance, polymarket=polymarket, chainlink=chainlink)
+    config = AppConfig.paper_from_env()
+    return TradingService(config=config, binance=binance, polymarket=polymarket, chainlink=chainlink)
 
 
 if __name__ == "__main__":

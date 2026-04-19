@@ -57,6 +57,23 @@ class BinanceMarketDataClient:
             )
         return candles
 
+    def price_at(self, at: datetime, symbol: str = "BTCUSDT") -> PriceTick:
+        end_time_ms = int(at.astimezone(UTC).timestamp() * 1000)
+        start_time_ms = max(0, end_time_ms - 60_000)
+        payload = _require_list(
+            _get_json(
+                f"{self.base_url}/api/v3/aggTrades?symbol={symbol}&startTime={start_time_ms}&endTime={end_time_ms}&limit=1000"
+            ),
+            "Binance aggTrades",
+        )
+        if not payload:
+            raise ValueError("unexpected Binance aggTrades payload")
+        item = _require_mapping(payload[-1], "Binance aggTrades")
+        trade_time = _coerce_float(item.get("T"))
+        if trade_time is None or trade_time > end_time_ms:
+            raise ValueError("unexpected Binance aggTrades payload")
+        return PriceTick(price=_require_float(item.get("p"), "Binance aggTrades"))
+
 
 @dataclass(slots=True)
 class PolymarketMarketClient:
@@ -77,6 +94,7 @@ class PolymarketMarketClient:
                 continue
 
             up_price, down_price = _extract_outcome_prices(item)
+            token_ids = _extract_outcome_token_ids(item)
             spread = _optional_float(item.get("spread"), "Polymarket spread")
             if spread is None:
                 spread = 0.02
@@ -85,6 +103,8 @@ class PolymarketMarketClient:
                 liquidity_value = item.get("liquidity")
             liquidity = 0.0 if liquidity_value in (None, "") else _require_float(liquidity_value, "Polymarket liquidity")
             reference_price = _optional_float(item.get("referencePrice"), "Polymarket reference price")
+            tick_size = _optional_positive_float(item.get("tickSize"), "Polymarket tickSize")
+            neg_risk = _optional_bool(item.get("negRisk"), "Polymarket negRisk")
 
             snapshots.append(
                 MarketSnapshot(
@@ -99,6 +119,11 @@ class PolymarketMarketClient:
                     up=OrderBookSide(price=up_price),
                     down=OrderBookSide(price=down_price),
                     reference_price=reference_price,
+                    end_date=_normalize_end_date(item.get("endDate")),
+                    token_id_up=token_ids.get("UP"),
+                    token_id_down=token_ids.get("DOWN"),
+                    tick_size=tick_size,
+                    neg_risk=neg_risk,
                 )
             )
         return snapshots
@@ -124,6 +149,7 @@ class PolymarketMarketClient:
                 continue
 
             prices = _extract_outcome_price_map(item)
+            token_ids = _extract_outcome_token_ids(item)
             liquidity_value = item.get("liquidityNum")
             if liquidity_value in (None, ""):
                 liquidity_value = item.get("liquidity")
@@ -142,6 +168,10 @@ class PolymarketMarketClient:
                     "no_price": prices.get("NO"),
                     "up_price": prices.get("UP"),
                     "down_price": prices.get("DOWN"),
+                    "token_id_up": token_ids.get("UP"),
+                    "token_id_down": token_ids.get("DOWN"),
+                    "tick_size": _optional_positive_float(item.get("tickSize"), "Polymarket tickSize"),
+                    "neg_risk": _optional_bool(item.get("negRisk"), "Polymarket negRisk"),
                 }
             )
 
@@ -165,6 +195,9 @@ class FixtureBinanceMarketDataClient:
 
     def klines(self, interval: str, limit: int = 3, symbol: str = "BTCUSDT") -> list[Candle]:
         return self.candles[:limit]
+
+    def price_at(self, at: datetime, symbol: str = "BTCUSDT") -> PriceTick:
+        return self.latest_tick
 
 
 @dataclass(slots=True)
@@ -190,6 +223,10 @@ class FixturePolymarketMarketClient:
             "no_price": None,
             "up_price": self.market.up.price,
             "down_price": self.market.down.price,
+            "token_id_up": self.market.token_id_up,
+            "token_id_down": self.market.token_id_down,
+            "tick_size": self.market.tick_size,
+            "neg_risk": self.market.neg_risk,
         }
         return [diagnostic][:limit]
 
@@ -222,6 +259,11 @@ def load_fixture_clients(path: str | Path) -> tuple[
         up=OrderBookSide(price=_require_probability(market_payload["up"]["price"], "fixture market up.price")),
         down=OrderBookSide(price=_require_probability(market_payload["down"]["price"], "fixture market down.price")),
         reference_price=reference_price,
+        end_date=_normalize_end_date(market_payload.get("end_date")),
+        token_id_up=_optional_string(market_payload.get("token_id_up"), "fixture market token_id_up"),
+        token_id_down=_optional_string(market_payload.get("token_id_down"), "fixture market token_id_down"),
+        tick_size=_optional_positive_float(market_payload.get("tick_size"), "fixture market tick_size"),
+        neg_risk=_optional_bool(market_payload.get("neg_risk"), "fixture market neg_risk"),
     )
     latest_price_payload = payload["latest_price"]
     latest_tick = PriceTick(
@@ -277,6 +319,38 @@ def _optional_float(value: object, context: str) -> float | None:
     return _require_float(value, context)
 
 
+def _optional_positive_float(value: object, context: str) -> float | None:
+    if value is None:
+        return None
+    number = _require_float(value, context)
+    if number <= 0.0:
+        raise ValueError(f"unexpected {context}")
+    return number
+
+
+def _optional_string(value: object, context: str) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        raise ValueError(f"unexpected {context}")
+    return text
+
+
+def _optional_bool(value: object, context: str) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered == "true":
+            return True
+        if lowered == "false":
+            return False
+    raise ValueError(f"unexpected {context}")
+
+
 def _require_mapping(payload: object, context: str) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(f"unexpected {context} payload")
@@ -316,6 +390,28 @@ def _extract_outcome_price_map(item: dict) -> dict[str, float]:
     return mapping
 
 
+def _extract_outcome_token_ids(item: dict) -> dict[str, str]:
+    token_ids_raw = item.get("clobTokenIds")
+    if token_ids_raw is None:
+        return {}
+    outcomes_raw = item.get("outcomes")
+    try:
+        token_ids = json.loads(token_ids_raw) if isinstance(token_ids_raw, str) else list(token_ids_raw)
+        outcomes = json.loads(outcomes_raw) if isinstance(outcomes_raw, str) else list(outcomes_raw or [])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        raise ValueError("unexpected Polymarket clob token ids") from None
+    if len(token_ids) != len(outcomes):
+        raise ValueError("unexpected Polymarket clob token ids")
+
+    mapping: dict[str, str] = {}
+    for name, token_id in zip(outcomes, token_ids, strict=True):
+        normalized = _optional_string(token_id, "Polymarket clob token ids")
+        if normalized is None:
+            raise ValueError("unexpected Polymarket clob token ids")
+        mapping[str(name).upper()] = normalized
+    return mapping
+
+
 def _seconds_to_expiry(end_date: object) -> int:
     if not end_date:
         return 0
@@ -324,3 +420,15 @@ def _seconds_to_expiry(end_date: object) -> int:
     except ValueError:
         return 0
     return max(0, int((end_dt - datetime.now(UTC)).total_seconds()))
+
+
+def _normalize_end_date(end_date: object) -> str | None:
+    if not end_date:
+        return None
+    try:
+        end_dt = datetime.fromisoformat(str(end_date).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if end_dt.tzinfo is None or end_dt.utcoffset() is None:
+        return None
+    return end_dt.isoformat()

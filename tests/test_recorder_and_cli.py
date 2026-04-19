@@ -1,6 +1,8 @@
 import json
 import subprocess
 import sys
+import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -20,6 +22,8 @@ def test_recorder_appends_jsonl(tmp_path: Path):
         side="UP",
         price=0.51,
         stake=20.0,
+        expires_at="2026-04-18T00:05:00+00:00",
+        reference_price=100000.0,
         signal=SignalDecision(
             should_trade=True,
             side="UP",
@@ -34,7 +38,394 @@ def test_recorder_appends_jsonl(tmp_path: Path):
 
     payload = json.loads((tmp_path / "paper_trades.jsonl").read_text().strip())
     assert payload["side"] == "UP"
+    assert payload["expires_at"] == "2026-04-18T00:05:00+00:00"
+    assert payload["reference_price"] == 100000.0
     assert payload["signal"]["signal_name"] == "momentum"
+
+
+def test_recorder_settles_due_trades_with_win_loss_and_void_outcomes(tmp_path: Path):
+    recorder = PaperTradeRecorder(tmp_path / "paper_trades.jsonl")
+    signal = SignalDecision(
+        should_trade=True,
+        side="UP",
+        signal_name="momentum",
+        confidence=0.7,
+        reasons=["trend"],
+    )
+    recorder.record(
+        PaperTradeRecord(
+            timestamp="2026-04-18T00:00:00+00:00",
+            market_id="win-up",
+            interval="5m",
+            side="UP",
+            price=0.4,
+            stake=20.0,
+            expires_at="2026-04-18T00:05:00+00:00",
+            reference_price=100000.0,
+            signal=signal,
+        )
+    )
+    recorder.record(
+        PaperTradeRecord(
+            timestamp="2026-04-18T00:00:00+00:00",
+            market_id="loss-down",
+            interval="5m",
+            side="DOWN",
+            price=0.25,
+            stake=20.0,
+            expires_at="2026-04-18T00:05:00+00:00",
+            reference_price=100000.0,
+            signal=signal,
+        )
+    )
+    recorder.record(
+        PaperTradeRecord(
+            timestamp="2026-04-18T00:00:00+00:00",
+            market_id="void-flat",
+            interval="5m",
+            side="UP",
+            price=0.6,
+            stake=20.0,
+            expires_at="2026-04-18T00:05:00+00:00",
+            reference_price=100100.0,
+            signal=signal,
+        )
+    )
+
+    settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
+
+    assert [item["market_id"] for item in settlements] == ["win-up", "loss-down", "void-flat"]
+    assert settlements[0]["outcome"] == "win"
+    assert settlements[0]["pnl"] == 30.0
+    assert settlements[1]["outcome"] == "loss"
+    assert settlements[1]["pnl"] == -20.0
+    assert settlements[2]["outcome"] == "void"
+    assert settlements[2]["pnl"] == 0.0
+
+    persisted = [
+        json.loads(line)
+        for line in (tmp_path / "paper_trades.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert persisted[0]["settlement_price"] == 100100.0
+    assert persisted[0]["settled_at"] == "2026-04-18T00:06:00+00:00"
+    assert persisted[1]["outcome"] == "loss"
+    assert persisted[2]["pnl"] == 0.0
+
+
+def test_recorder_settle_due_uses_expiry_as_closed_at_for_risk_windows(tmp_path: Path):
+    recorder = PaperTradeRecorder(tmp_path / "paper_trades.jsonl")
+    recorder.record(
+        PaperTradeRecord(
+            timestamp="2026-04-18T00:00:00+00:00",
+            market_id="due-up",
+            interval="5m",
+            side="UP",
+            price=0.4,
+            stake=20.0,
+            expires_at="2026-04-18T00:05:00+00:00",
+            reference_price=100000.0,
+            signal=SignalDecision(
+                should_trade=True,
+                side="UP",
+                signal_name="momentum",
+                confidence=0.7,
+                reasons=["trend"],
+            ),
+        )
+    )
+
+    settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
+
+    assert settlements[0]["closed_at"] == datetime(2026, 4, 18, 0, 5, tzinfo=UTC)
+
+
+def test_recorder_hydrates_closed_trades_from_expiry_instead_of_settled_at(tmp_path: Path):
+    path = tmp_path / "paper_trades.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-04-17T23:55:00+00:00",
+                "market_id": "settled-loss",
+                "interval": "5m",
+                "side": "UP",
+                "price": 0.55,
+                "stake": 30.0,
+                "expires_at": "2026-04-17T23:59:00+00:00",
+                "reference_price": 100200.0,
+                "settled_at": "2026-04-18T00:06:00+00:00",
+                "settlement_price": 100100.0,
+                "outcome": "loss",
+                "pnl": -30.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    trades = PaperTradeRecorder(path).settled_trades()
+
+    assert trades == [
+        {
+            "market_id": "settled-loss",
+            "pnl": -30.0,
+            "closed_at": datetime(2026, 4, 17, 23, 59, tzinfo=UTC),
+        }
+    ]
+
+
+def test_recorder_skips_legacy_records_without_settlement_metadata(tmp_path: Path):
+    path = tmp_path / "paper_trades.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-04-18T00:00:00+00:00",
+                "market_id": "legacy-trade",
+                "interval": "5m",
+                "side": "UP",
+                "price": 0.51,
+                "stake": 20.0,
+                "signal": {
+                    "should_trade": True,
+                    "side": "UP",
+                    "signal_name": "momentum",
+                    "confidence": 0.7,
+                    "reasons": ["trend"],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    recorder = PaperTradeRecorder(path)
+
+    settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
+
+    assert settlements == []
+    persisted = json.loads(path.read_text(encoding="utf-8").strip())
+    assert persisted["market_id"] == "legacy-trade"
+    assert "settled_at" not in persisted
+
+
+def test_recorder_skips_naive_expires_at_without_crashing_or_rewriting_line(tmp_path: Path):
+    path = tmp_path / "paper_trades.jsonl"
+    raw_line = json.dumps(
+        {
+            "timestamp": "2026-04-18T00:00:00+00:00",
+            "market_id": "naive-expiry",
+            "interval": "5m",
+            "side": "UP",
+            "price": 0.51,
+            "stake": 20.0,
+            "expires_at": "2026-04-18T00:05:00",
+            "reference_price": 100000.0,
+        }
+    )
+    path.write_text(raw_line + "\n", encoding="utf-8")
+    recorder = PaperTradeRecorder(path)
+
+    settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
+
+    assert settlements == []
+    assert path.read_text(encoding="utf-8") == raw_line + "\n"
+
+
+def test_recorder_preserves_malformed_and_non_finite_lines_while_settling_valid_rows(tmp_path: Path):
+    path = tmp_path / "paper_trades.jsonl"
+    valid_due = json.dumps(
+        {
+            "timestamp": "2026-04-18T00:00:00+00:00",
+            "market_id": "valid-due",
+            "interval": "5m",
+            "side": "UP",
+            "price": 0.4,
+            "stake": 20.0,
+            "expires_at": "2026-04-18T00:05:00+00:00",
+            "reference_price": 100000.0,
+        }
+    )
+    malformed = "not-json"
+    non_finite = '{"timestamp":"2026-04-18T00:00:00+00:00","market_id":"bad-nan","interval":"5m","side":"UP","price":0.4,"stake":NaN,"expires_at":"2026-04-18T00:05:00+00:00","reference_price":100000.0}'
+    path.write_text("\n".join([valid_due, malformed, non_finite]) + "\n", encoding="utf-8")
+    recorder = PaperTradeRecorder(path)
+
+    settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
+
+    assert [item["market_id"] for item in settlements] == ["valid-due"]
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[1] == malformed
+    assert lines[2] == non_finite
+    persisted = json.loads(lines[0])
+    assert persisted["market_id"] == "valid-due"
+    assert persisted["outcome"] == "win"
+
+
+def test_recorder_settle_due_does_not_truncate_the_ledger_in_place(tmp_path: Path, monkeypatch):
+    path = tmp_path / "paper_trades.jsonl"
+    path.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-04-18T00:00:00+00:00",
+                "market_id": "valid-due",
+                "interval": "5m",
+                "side": "UP",
+                "price": 0.4,
+                "stake": 20.0,
+                "expires_at": "2026-04-18T00:05:00+00:00",
+                "reference_price": 100000.0,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    recorder = PaperTradeRecorder(path)
+    original_open = Path.open
+
+    def guarded_open(self: Path, mode: str = "r", *args, **kwargs):
+        if self == path and "w" in mode:
+            raise AssertionError("ledger must not be rewritten in place")
+        return original_open(self, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", guarded_open)
+
+    settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
+
+    assert [item["market_id"] for item in settlements] == ["valid-due"]
+    persisted = json.loads(path.read_text(encoding="utf-8").strip())
+    assert persisted["settlement_price"] == 100100.0
+
+
+def test_recorder_serializes_record_and_settle_due_to_avoid_lost_updates(tmp_path: Path, monkeypatch):
+    path = tmp_path / "paper_trades.jsonl"
+    recorder = PaperTradeRecorder(path)
+    recorder.record(
+        PaperTradeRecord(
+            timestamp="2026-04-18T00:00:00+00:00",
+            market_id="due-trade",
+            interval="5m",
+            side="UP",
+            price=0.4,
+            stake=20.0,
+            expires_at="2026-04-18T00:05:00+00:00",
+            reference_price=100000.0,
+            signal=SignalDecision(
+                should_trade=True,
+                side="UP",
+                signal_name="momentum",
+                confidence=0.7,
+                reasons=["trend"],
+            ),
+        )
+    )
+
+    read_started = threading.Event()
+    release_read = threading.Event()
+    original_read_text = Path.read_text
+
+    def blocking_read_text(self: Path, *args, **kwargs):
+        content = original_read_text(self, *args, **kwargs)
+        if self == path and not read_started.is_set():
+            read_started.set()
+            release_read.wait(timeout=2)
+        return content
+
+    monkeypatch.setattr(Path, "read_text", blocking_read_text)
+
+    settle_thread = threading.Thread(
+        target=lambda: recorder.settle_due(
+            current_btc_price=100100.0,
+            now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC),
+        )
+    )
+    record_thread = threading.Thread(
+        target=lambda: recorder.record(
+            PaperTradeRecord(
+                timestamp="2026-04-18T00:06:30+00:00",
+                market_id="new-trade",
+                interval="5m",
+                side="DOWN",
+                price=0.48,
+                stake=20.0,
+                expires_at="2026-04-18T00:10:00+00:00",
+                reference_price=100100.0,
+                signal=SignalDecision(
+                    should_trade=True,
+                    side="DOWN",
+                    signal_name="fade",
+                    confidence=0.6,
+                    reasons=["mean_reversion"],
+                ),
+            )
+        )
+    )
+
+    settle_thread.start()
+    assert read_started.wait(timeout=2)
+    record_thread.start()
+    release_read.set()
+    settle_thread.join(timeout=2)
+    record_thread.join(timeout=2)
+
+    records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    assert [record["market_id"] for record in records] == ["due-trade", "new-trade"]
+    assert records[0]["outcome"] == "win"
+
+
+def test_app_config_defaults_keep_live_trading_paper_safe():
+    config = AppConfig.from_env()
+
+    assert config.trading_mode == "paper"
+    assert config.polymarket_host == "https://clob.polymarket.com"
+    assert config.polygon_chain_id == 137
+    assert config.wallet_private_key is None
+    assert config.signature_type is None
+    assert config.funder_address is None
+    assert config.live_max_order_usd == 10.0
+    assert config.live_allow_market_ids == ()
+    assert config.live_require_explicit_confirm is True
+    assert config.paper_trades_path == Path("data/paper_trades.jsonl")
+    assert config.live_orders_path == Path("data/live_orders.jsonl")
+
+
+def test_app_config_from_env_reads_live_fields(monkeypatch):
+    monkeypatch.setenv("TRADING_MODE", "live")
+    monkeypatch.setenv("POLYMARKET_HOST", "https://example-clob.invalid")
+    monkeypatch.setenv("POLYGON_CHAIN_ID", "80002")
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", "0xabc123")
+    monkeypatch.setenv("SIGNATURE_TYPE", "2")
+    monkeypatch.setenv("FUNDER_ADDRESS", "0x0000000000000000000000000000000000000001")
+    monkeypatch.setenv("LIVE_MAX_ORDER_USD", "25.5")
+    monkeypatch.setenv("LIVE_ALLOW_MARKET_IDS", "btc-5m-1, btc-15m-1 ,, ")
+    monkeypatch.setenv("LIVE_REQUIRE_EXPLICIT_CONFIRM", "false")
+    monkeypatch.setenv("PAPER_TRADES_PATH", "runtime/paper.jsonl")
+    monkeypatch.setenv("LIVE_ORDERS_PATH", "runtime/live.jsonl")
+
+    config = AppConfig.from_env()
+
+    assert config.trading_mode == "live"
+    assert config.polymarket_host == "https://example-clob.invalid"
+    assert config.polygon_chain_id == 80002
+    assert config.wallet_private_key == "0xabc123"
+    assert config.signature_type == 2
+    assert config.funder_address == "0x0000000000000000000000000000000000000001"
+    assert config.live_max_order_usd == 25.5
+    assert config.live_allow_market_ids == ("btc-5m-1", "btc-15m-1")
+    assert config.live_require_explicit_confirm is False
+    assert config.paper_trades_path == Path("runtime/paper.jsonl")
+    assert config.live_orders_path == Path("runtime/live.jsonl")
+
+
+def test_app_config_from_env_rejects_non_finite_float(monkeypatch):
+    monkeypatch.setenv("LIVE_MAX_ORDER_USD", "NaN")
+
+    with pytest.raises(ValueError, match="invalid float for LIVE_MAX_ORDER_USD"):
+        AppConfig.from_env()
+
+
+def test_app_config_from_env_rejects_non_positive_min_seconds(monkeypatch):
+    monkeypatch.setenv("MIN_SECONDS_5M", "-1")
+
+    with pytest.raises(ValueError, match="invalid positive int for MIN_SECONDS_5M"):
+        AppConfig.from_env()
 
 
 def test_cli_supports_oneshot_and_loop():
@@ -208,10 +599,7 @@ def test_oneshot_fixture_runs_full_pipeline(monkeypatch, tmp_path: Path, capsys)
         encoding="utf-8",
     )
     paper_trades_path = tmp_path / "paper_trades.jsonl"
-    monkeypatch.setattr(
-        "pm_bot.config.AppConfig.from_env",
-        classmethod(lambda cls: AppConfig(paper_trades_path=paper_trades_path)),
-    )
+    monkeypatch.setenv("PAPER_TRADES_PATH", str(paper_trades_path))
     monkeypatch.setattr(
         sys,
         "argv",
@@ -227,6 +615,59 @@ def test_oneshot_fixture_runs_full_pipeline(monkeypatch, tmp_path: Path, capsys)
     records = [json.loads(line) for line in paper_trades_path.read_text(encoding="utf-8").splitlines()]
     assert records[0]["market_id"] == "fixture-btc-5m"
     assert records[0]["signal"]["signal_name"] == "oracle_delay"
+
+
+def test_oneshot_fixture_stays_paper_only_with_live_config_present(monkeypatch, tmp_path: Path, capsys):
+    fixture_path = tmp_path / "fixture.json"
+    fixture_path.write_text(
+        json.dumps(
+            {
+                "market": {
+                    "market_id": "fixture-btc-5m",
+                    "slug": "btc-updown-5m-fixture",
+                    "interval": "5m",
+                    "active": True,
+                    "closed": False,
+                    "seconds_to_expiry": 240,
+                    "liquidity": 20000,
+                    "spread": 0.02,
+                    "up": {"price": 0.51},
+                    "down": {"price": 0.49},
+                    "reference_price": 100000.0,
+                },
+                "latest_price": {"price": 100060.0, "volume": 120.0},
+                "candles": [
+                    {"open": 99980.0, "high": 100010.0, "low": 99970.0, "close": 100000.0},
+                    {"open": 100000.0, "high": 100040.0, "low": 99995.0, "close": 100030.0},
+                    {"open": 100030.0, "high": 100070.0, "low": 100020.0, "close": 100060.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    paper_trades_path = tmp_path / "paper_trades.jsonl"
+    live_orders_path = tmp_path / "live_orders.jsonl"
+    monkeypatch.setenv("TRADING_MODE", "live")
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", "0xabc123")
+    monkeypatch.setenv("SIGNATURE_TYPE", "0")
+    monkeypatch.setenv("FUNDER_ADDRESS", "0x0000000000000000000000000000000000000001")
+    monkeypatch.setenv("LIVE_ALLOW_MARKET_IDS", "fixture-btc-5m")
+    monkeypatch.setenv("LIVE_MAX_ORDER_USD", "NaN")
+    monkeypatch.setenv("PAPER_TRADES_PATH", str(paper_trades_path))
+    monkeypatch.setenv("LIVE_ORDERS_PATH", str(live_orders_path))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["pm-bot", "oneshot", "--interval", "5m", "--fixture", str(fixture_path)],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["action"] == "paper_trade"
+    assert paper_trades_path.exists()
+    assert not live_orders_path.exists()
 
 
 def test_oneshot_missing_fixture_returns_json_error(monkeypatch, tmp_path: Path, capsys):
