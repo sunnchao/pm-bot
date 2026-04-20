@@ -1,5 +1,6 @@
 from datetime import UTC, datetime, timedelta
 
+from pm_bot.config import AppConfig
 from pm_bot.filters import evaluate_no_trade_filters
 from pm_bot.models import MarketSnapshot, OrderBookSide, SignalDecision
 from pm_bot.risk import RiskManager
@@ -64,3 +65,56 @@ def test_risk_manager_suggests_larger_size_for_oracle_delay():
     stake = risk.position_size(balance=1_000.0, decision=decision)
 
     assert stake == 40.0
+
+
+def test_risk_manager_resets_five_loss_lockout_after_configured_cooldown():
+    risk = RiskManager(config=AppConfig(cooldown_after_five_losses_minutes=30))
+    start = datetime(2026, 4, 18, 12, 0, tzinfo=UTC)
+    for minute in range(5):
+        risk.record_closed_trade(pnl=-1.0, closed_at=start + timedelta(minutes=minute))
+
+    allowed_during_lockout, reasons_during_lockout = risk.allow_trade(
+        balance=1_000.0,
+        now=start + timedelta(minutes=33),
+    )
+    allowed_after_reset, reasons_after_reset = risk.allow_trade(
+        balance=1_000.0,
+        now=start + timedelta(minutes=35),
+    )
+
+    assert allowed_during_lockout is False
+    assert reasons_during_lockout == ["five_loss_lockout"]
+    assert allowed_after_reset is True
+    assert reasons_after_reset == []
+
+
+def test_risk_manager_caps_live_position_size_to_live_max_order_usd():
+    risk = RiskManager(config=AppConfig(live_max_order_usd=10.0))
+    decision = SignalDecision(
+        should_trade=True,
+        side="UP",
+        signal_name="momentum",
+        confidence=0.7,
+        reasons=["trend"],
+    )
+
+    paper_stake = risk.position_size(balance=1_000.0, decision=decision)
+    live_stake = risk.position_size(balance=1_000.0, decision=decision, live_mode=True)
+
+    assert paper_stake == 20.0
+    assert live_stake == 10.0
+
+
+def test_risk_manager_quantizes_position_size_with_decimal_cents():
+    risk = RiskManager(config=AppConfig(base_risk_pct=0.026665))
+    decision = SignalDecision(
+        should_trade=True,
+        side="UP",
+        signal_name="momentum",
+        confidence=0.7,
+        reasons=["trend"],
+    )
+
+    stake = risk.position_size(balance=1_000.0, decision=decision)
+
+    assert stake == 26.66

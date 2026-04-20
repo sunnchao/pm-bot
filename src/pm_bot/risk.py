@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 
 from pm_bot.config import AppConfig
 from pm_bot.models import SignalDecision
+from pm_bot.money import quantize_usd, to_decimal, to_float
 
 
 @dataclass(slots=True)
@@ -23,29 +24,69 @@ class RiskManager:
 
     def allow_trade(self, balance: float, now: datetime) -> tuple[bool, list[str]]:
         reasons: list[str] = []
-        daily_pnl = sum(t.pnl for t in self.closed_trades if t.closed_at.date() == now.date())
-        if daily_pnl <= -(balance * self.config.max_daily_drawdown_pct):
+        balance_amount = to_decimal(balance)
+        max_daily_drawdown_pct = to_decimal(self.config.max_daily_drawdown_pct)
+        daily_pnl = sum(
+            (to_decimal(trade.pnl) for trade in self.closed_trades if trade.closed_at.date() == now.date()),
+            start=to_decimal(0),
+        )
+        if daily_pnl <= -(balance_amount * max_daily_drawdown_pct):
             reasons.append("daily_drawdown_limit")
 
-        loss_streak = 0
-        for trade in reversed(self.closed_trades):
-            if trade.pnl < 0:
-                loss_streak += 1
-            else:
-                break
-
-        if loss_streak >= 5:
+        five_loss_cooldown = timedelta(minutes=self.config.cooldown_after_five_losses_minutes)
+        five_loss_streak, last_five_loss_time = self._loss_streak(reset_after=five_loss_cooldown)
+        if (
+            last_five_loss_time is not None
+            and five_loss_streak >= 5
+            and now < last_five_loss_time + five_loss_cooldown
+        ):
             reasons.append("five_loss_lockout")
-        elif loss_streak >= 3 and self.closed_trades:
-            last_loss_time = self.closed_trades[-1].closed_at
-            cooldown = timedelta(minutes=self.config.cooldown_after_three_losses_minutes)
-            if now < last_loss_time + cooldown:
+        else:
+            three_loss_cooldown = timedelta(minutes=self.config.cooldown_after_three_losses_minutes)
+            three_loss_streak, last_three_loss_time = self._loss_streak(reset_after=three_loss_cooldown)
+            if (
+                last_three_loss_time is not None
+                and three_loss_streak >= 3
+                and now < last_three_loss_time + three_loss_cooldown
+            ):
                 reasons.append("cooldown_after_losses")
 
         return not reasons, reasons
 
-    def position_size(self, balance: float, decision: SignalDecision) -> float:
+    def position_size(
+        self,
+        balance: float,
+        decision: SignalDecision,
+        *,
+        live_mode: bool = False,
+    ) -> float:
         if not decision.should_trade:
             return 0.0
         risk_pct = self.config.strong_risk_pct if decision.signal_name == "oracle_delay" else self.config.base_risk_pct
-        return round(balance * risk_pct, 2)
+        stake = quantize_usd(to_decimal(balance) * to_decimal(risk_pct))
+        live_max_order_usd = to_decimal(self.config.live_max_order_usd)
+        if live_mode and live_max_order_usd.is_finite() and live_max_order_usd > 0:
+            stake = min(stake, live_max_order_usd)
+        return to_float(quantize_usd(stake))
+
+    def _loss_streak(self, *, reset_after: timedelta | None = None) -> tuple[int, datetime | None]:
+        loss_streak = 0
+        last_loss_time: datetime | None = None
+        newer_loss_time: datetime | None = None
+
+        for trade in reversed(self.closed_trades):
+            if to_decimal(trade.pnl) >= 0:
+                break
+            if (
+                reset_after is not None
+                and newer_loss_time is not None
+                and newer_loss_time - trade.closed_at >= reset_after
+            ):
+                break
+
+            loss_streak += 1
+            if last_loss_time is None:
+                last_loss_time = trade.closed_at
+            newer_loss_time = trade.closed_at
+
+        return loss_streak, last_loss_time

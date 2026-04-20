@@ -6,21 +6,36 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from pm_bot.models import Candle, MarketSnapshot, OrderBookSide, PriceTick
+from pm_bot.retry import READ_ONLY_API_RETRY_POLICY, is_retryable_status_code, retry_with_backoff
 
 
 def _get_json(url: str) -> object:
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "pm-bot/0.1 (+https://github.com/sunnchao/pm-bot)",
-            "Accept": "application/json",
-        },
+    def load() -> object:
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "pm-bot/0.1 (+https://github.com/sunnchao/pm-bot)",
+                "Accept": "application/json",
+            },
+        )
+        with urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    return retry_with_backoff(
+        load,
+        should_retry=_is_retryable_read_error,
+        policy=READ_ONLY_API_RETRY_POLICY,
     )
-    with urlopen(request, timeout=10) as response:
-        return json.loads(response.read().decode("utf-8"))
+
+
+def _is_retryable_read_error(exc: Exception) -> bool:
+    if isinstance(exc, HTTPError):
+        return is_retryable_status_code(exc.code)
+    return isinstance(exc, URLError)
 
 
 @dataclass(slots=True)

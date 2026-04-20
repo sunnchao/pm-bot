@@ -19,6 +19,7 @@ class AppConfig:
     strong_risk_pct: float = 0.04
     max_daily_drawdown_pct: float = 0.05
     cooldown_after_three_losses_minutes: int = 30
+    cooldown_after_five_losses_minutes: int = 60
     trading_mode: str = "paper"
     polymarket_host: str = "https://clob.polymarket.com"
     polygon_chain_id: int = 137
@@ -48,6 +49,10 @@ class AppConfig:
             cooldown_after_three_losses_minutes=_env_int(
                 "COOLDOWN_AFTER_THREE_LOSSES_MINUTES",
                 defaults.cooldown_after_three_losses_minutes,
+            ),
+            cooldown_after_five_losses_minutes=_env_int(
+                "COOLDOWN_AFTER_FIVE_LOSSES_MINUTES",
+                defaults.cooldown_after_five_losses_minutes,
             ),
             trading_mode=_env_text("TRADING_MODE") or defaults.trading_mode,
             polymarket_host=_env_text("POLYMARKET_HOST") or defaults.polymarket_host,
@@ -82,6 +87,10 @@ class AppConfig:
             cooldown_after_three_losses_minutes=_env_int(
                 "COOLDOWN_AFTER_THREE_LOSSES_MINUTES",
                 defaults.cooldown_after_three_losses_minutes,
+            ),
+            cooldown_after_five_losses_minutes=_env_int(
+                "COOLDOWN_AFTER_FIVE_LOSSES_MINUTES",
+                defaults.cooldown_after_five_losses_minutes,
             ),
             trading_mode="paper",
             paper_trades_path=_env_path("PAPER_TRADES_PATH", defaults.paper_trades_path),

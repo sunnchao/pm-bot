@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from time import perf_counter_ns
 
 from pm_bot.clients import BinanceMarketDataClient, ChainlinkReferenceClient, PolymarketMarketClient
 from pm_bot.config import AppConfig
 from pm_bot.execution import ExecutionRequest, PaperExecutor
 from pm_bot.filters import evaluate_no_trade_filters
 from pm_bot.live_guards import evaluate_live_order_guards
+from pm_bot.metrics import OneShotCycleMetrics, emit_cycle_error, emit_cycle_result
 from pm_bot.models import MarketSnapshot
 from pm_bot.recorder import PaperTradeRecorder
 from pm_bot.risk import RiskManager
@@ -28,7 +30,7 @@ class OneShotResult:
     execution_status: str | None = None
     execution_message: str | None = None
     order_id: str | None = None
-    client_order_id: str | None = None
+    submission_id: str | None = None
 
 
 class TradingService:
@@ -57,11 +59,44 @@ class TradingService:
         return self.polymarket.discover_markets(keywords=keywords, limit=limit)
 
     def oneshot(self, interval: str, balance: float = 1_000.0, *, live_confirmed: bool = False) -> OneShotResult:
+        started_at_ns = perf_counter_ns()
+        cycle_metrics = OneShotCycleMetrics(interval=interval)
+        try:
+            result = self._oneshot_impl(
+                interval=interval,
+                balance=balance,
+                live_confirmed=live_confirmed,
+                cycle_metrics=cycle_metrics,
+            )
+        except Exception as exc:
+            emit_cycle_error(cycle_metrics, error=exc, duration_ms=_duration_ms(started_at_ns))
+            raise
+
+        emit_cycle_result(
+            cycle_metrics,
+            action=result.action,
+            duration_ms=_duration_ms(started_at_ns),
+            execution_status=result.execution_status,
+            execution_message=result.execution_message,
+            order_id=result.order_id,
+            submission_id=result.submission_id,
+        )
+        return result
+
+    def _oneshot_impl(
+        self,
+        interval: str,
+        balance: float,
+        *,
+        live_confirmed: bool,
+        cycle_metrics: OneShotCycleMetrics,
+    ) -> OneShotResult:
         now = datetime.now(UTC)
         executor = self.executor
         recorder = self.recorder
         uses_paper_execution = executor is None or isinstance(executor, PaperExecutor)
         if self.config.trading_mode == "live" and uses_paper_execution:
+            cycle_metrics.reasons = ["live_executor_not_configured"]
             return OneShotResult(
                 interval=interval,
                 market_id=None,
@@ -83,6 +118,9 @@ class TradingService:
                 self._loaded_historical_settlements = True
         latest_tick = self.binance.latest_price()
         if uses_paper_execution and recorder is not None:
+            # In paper mode Binance remains the fast market-data source for both
+            # signal inputs and the surrogate expiry price used to simulate how
+            # Chainlink would resolve against the recorded reference price.
             for settlement in recorder.settle_due(
                 current_btc_price=latest_tick.price,
                 now=now,
@@ -92,8 +130,10 @@ class TradingService:
 
         market = self._select_market(interval, prefer_allowlisted_live_market=not uses_paper_execution)
         if market is None:
+            cycle_metrics.reasons = ["no_active_market"]
             return OneShotResult(interval=interval, market_id=None, action="skip", reasons=["no_active_market"])
 
+        cycle_metrics.market_id = market.market_id
         candles = self.binance.klines(interval=interval, limit=3)
         recent_ticks = [PriceTick(price=c.close, volume=0.0) for c in candles[:-1]] + [latest_tick]
         realized_volatility_bps = _realized_volatility_bps(candles)
@@ -111,6 +151,7 @@ class TradingService:
             ]
             blocked = bool(filter_reasons)
         if blocked:
+            cycle_metrics.reasons = list(filter_reasons)
             return OneShotResult(interval=interval, market_id=market.market_id, action="skip", reasons=filter_reasons)
 
         reference_price = self.chainlink.reference_price(market)
@@ -125,6 +166,10 @@ class TradingService:
             recent_ticks=recent_ticks,
             candles=candles,
         )
+        cycle_metrics.signal_name = decision.signal_name
+        cycle_metrics.confidence = decision.confidence
+        cycle_metrics.side = decision.side
+        cycle_metrics.reasons = list(decision.reasons)
         if not decision.should_trade:
             return OneShotResult(
                 interval=interval,
@@ -137,11 +182,18 @@ class TradingService:
 
         allowed, risk_reasons = self.risk_manager.allow_trade(balance=balance, now=now)
         if not allowed:
+            cycle_metrics.reasons = list(risk_reasons)
             return OneShotResult(interval=interval, market_id=market.market_id, action="skip", reasons=risk_reasons)
 
-        stake = self.risk_manager.position_size(balance=balance, decision=decision)
+        stake = self.risk_manager.position_size(
+            balance=balance,
+            decision=decision,
+            live_mode=not uses_paper_execution,
+        )
+        cycle_metrics.stake = stake
         if decision.side not in {"UP", "DOWN"}:
             execution_status = "blocked_live_order" if not uses_paper_execution else None
+            cycle_metrics.reasons = ["decision_side_invalid"]
             return OneShotResult(
                 interval=interval,
                 market_id=market.market_id,
@@ -156,6 +208,7 @@ class TradingService:
             )
         if market.reference_price is None:
             execution_status = "blocked_live_order" if not uses_paper_execution else None
+            cycle_metrics.reasons = ["reference_price_unavailable"]
             return OneShotResult(
                 interval=interval,
                 market_id=market.market_id,
@@ -204,6 +257,7 @@ class TradingService:
                 live_confirmed=live_confirmed,
             )
             if live_guard_reasons:
+                cycle_metrics.reasons = list(live_guard_reasons)
                 return OneShotResult(
                     interval=interval,
                     market_id=market.market_id,
@@ -229,7 +283,7 @@ class TradingService:
             execution_status=execution_result.status,
             execution_message=execution_result.message,
             order_id=execution_result.order_id,
-            client_order_id=execution_result.client_order_id,
+            submission_id=execution_result.submission_id,
         )
 
     def _select_market(self, interval: str, *, prefer_allowlisted_live_market: bool = False) -> MarketSnapshot | None:
@@ -243,6 +297,10 @@ class TradingService:
             if allowlisted:
                 pool = allowlisted
         return max(pool, key=lambda item: item.liquidity)
+
+
+def _duration_ms(started_at_ns: int) -> float:
+    return (perf_counter_ns() - started_at_ns) / 1_000_000
 
 
 def _realized_volatility_bps(candles: list) -> float:

@@ -1,7 +1,11 @@
 import json
-from datetime import datetime
+import logging
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
+import pm_bot.service as service_module
 from pm_bot.clients import (
     FixtureBinanceMarketDataClient,
     FixtureChainlinkReferenceClient,
@@ -60,6 +64,17 @@ def make_service(
     )
 
 
+def freeze_service_now(monkeypatch, now: datetime) -> None:
+    class FrozenDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            if tz is None:
+                return now.replace(tzinfo=None)
+            return now.astimezone(tz)
+
+    monkeypatch.setattr(service_module, "datetime", FrozenDateTime)
+
+
 class NoActiveMarketClient:
     def active_markets(self, interval: str) -> list[MarketSnapshot]:
         return []
@@ -83,18 +98,29 @@ class SettlementAwareBinanceClient(FixtureBinanceMarketDataClient):
 
 
 class RecordingExecutor:
-    def __init__(self, status: str = "accepted", message: str = "stubbed") -> None:
+    def __init__(
+        self,
+        status: str = "accepted",
+        message: str = "stubbed",
+        *,
+        action: str = "live_trade",
+        order_id: str | None = "order-123",
+        submission_id: str | None = "submission-123",
+    ) -> None:
         self.requests = []
+        self.action = action
         self.status = status
         self.message = message
+        self.order_id = order_id
+        self.submission_id = submission_id
 
     def execute(self, request):
         self.requests.append(request)
         return ExecutionResult(
-            action="live_trade",
+            action=self.action,
             status=self.status,
-            order_id="order-123",
-            client_order_id="client-123",
+            order_id=self.order_id,
+            submission_id=self.submission_id,
             submitted_price=request.price,
             submitted_size=request.size_usd,
             message=self.message,
@@ -116,8 +142,228 @@ class StubRiskManager:
     def allow_trade(self, balance: float, now: datetime):
         return True, []
 
-    def position_size(self, balance: float, decision: SignalDecision) -> float:
+    def position_size(
+        self,
+        balance: float,
+        decision: SignalDecision,
+        *,
+        live_mode: bool = False,
+    ) -> float:
         return self.stake
+
+
+def _cycle_metric_records(caplog):
+    return [record for record in caplog.records if record.name == "pm_bot.cycle" and record.msg == "trading_cycle"]
+
+
+def test_oneshot_emits_cycle_metrics_for_success(tmp_path: Path, caplog):
+    service = make_service(tmp_path / "paper_trades.jsonl")
+
+    with caplog.at_level(logging.INFO, logger="pm_bot.cycle"):
+        result = service.oneshot(interval="5m", balance=1_000.0)
+
+    assert result.action == "paper_trade"
+    records = _cycle_metric_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.event == "trading_cycle"
+    assert record.outcome == "success"
+    assert record.interval == "5m"
+    assert record.action == "paper_trade"
+    assert record.market_id == "btc-5m-1"
+    assert record.signal_name == "oracle_delay"
+    assert record.confidence == 0.9
+    assert record.side == "UP"
+    assert record.stake == 40.0
+    assert record.reasons == ["delta=100.00"]
+    assert record.execution_status == "recorded"
+    assert record.execution_message == "paper trade recorded"
+    assert record.duration_ms >= 0.0
+
+
+def test_oneshot_emits_cycle_metrics_for_skip(tmp_path: Path, caplog):
+    decision = SignalDecision(
+        should_trade=False,
+        side=None,
+        signal_name="test_signal",
+        confidence=0.15,
+        reasons=["no_edge"],
+    )
+    service = make_service(
+        tmp_path / "paper_trades.jsonl",
+        signal_engine=StubSignalEngine(decision),
+    )
+
+    with caplog.at_level(logging.INFO, logger="pm_bot.cycle"):
+        result = service.oneshot(interval="5m", balance=1_000.0)
+
+    assert result.action == "skip"
+    records = _cycle_metric_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.event == "trading_cycle"
+    assert record.outcome == "skip"
+    assert record.interval == "5m"
+    assert record.action == "skip"
+    assert record.market_id == "btc-5m-1"
+    assert record.signal_name == "test_signal"
+    assert record.confidence == 0.15
+    assert record.side is None
+    assert record.stake == 0.0
+    assert record.reasons == ["no_edge"]
+    assert record.execution_status is None
+    assert record.execution_message is None
+    assert record.duration_ms >= 0.0
+
+
+def test_oneshot_emits_cycle_metrics_for_error(tmp_path: Path, caplog):
+    base_service = make_service(tmp_path / "paper_trades.jsonl")
+    service = TradingService(
+        config=base_service.config,
+        binance=base_service.binance,
+        polymarket=base_service.polymarket,
+        chainlink=FixtureChainlinkReferenceClient(reference=float("nan")),
+        signal_engine=base_service.signal_engine,
+        risk_manager=base_service.risk_manager,
+        recorder=base_service.recorder,
+    )
+
+    with caplog.at_level(logging.ERROR, logger="pm_bot.cycle"):
+        with pytest.raises(ValueError, match="unexpected reference price"):
+            service.oneshot(interval="5m", balance=1_000.0)
+
+    records = _cycle_metric_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.event == "trading_cycle"
+    assert record.outcome == "error"
+    assert record.interval == "5m"
+    assert record.action == "error"
+    assert record.market_id == "btc-5m-1"
+    assert record.signal_name is None
+    assert record.side is None
+    assert record.stake == 0.0
+    assert record.reasons == []
+    assert record.error_type == "ValueError"
+    assert record.error_message == "unexpected reference price"
+    assert record.duration_ms >= 0.0
+
+
+def test_oneshot_emits_cycle_metrics_for_live_execution_error(tmp_path: Path, caplog):
+    decision = SignalDecision(
+        should_trade=True,
+        side="DOWN",
+        signal_name="test_signal",
+        confidence=0.42,
+        reasons=["test_reason"],
+    )
+    market = make_market(
+        token_id_up="token-up",
+        token_id_down="token-down",
+        tick_size=0.01,
+        neg_risk=False,
+    )
+    base_service = make_service(
+        tmp_path / "paper_trades.jsonl",
+        market=market,
+        signal_engine=StubSignalEngine(decision),
+    )
+    executor = RecordingExecutor(status="error", message="live executor failed")
+    service = TradingService(
+        config=AppConfig(
+            trading_mode="live",
+            wallet_private_key="0xabc123",
+            signature_type=0,
+            funder_address="0x0000000000000000000000000000000000000001",
+            live_allow_market_ids=(market.market_id,),
+            live_max_order_usd=100.0,
+            paper_trades_path=base_service.config.paper_trades_path,
+        ),
+        binance=base_service.binance,
+        polymarket=base_service.polymarket,
+        chainlink=base_service.chainlink,
+        signal_engine=base_service.signal_engine,
+        risk_manager=base_service.risk_manager,
+        recorder=base_service.recorder,
+        executor=executor,
+    )
+
+    with caplog.at_level(logging.INFO, logger="pm_bot.cycle"):
+        result = service.oneshot(interval="5m", balance=1_000.0, live_confirmed=True)
+
+    assert result.action == "live_trade"
+    assert result.execution_status == "error"
+    records = _cycle_metric_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.event == "trading_cycle"
+    assert record.outcome == "error"
+    assert record.action == "live_trade"
+    assert record.execution_status == "error"
+    assert record.execution_message == "live executor failed"
+    assert record.duration_ms >= 0.0
+
+
+def test_oneshot_emits_cycle_metrics_for_untrackable_live_execution_error(tmp_path: Path, caplog):
+    decision = SignalDecision(
+        should_trade=True,
+        side="DOWN",
+        signal_name="test_signal",
+        confidence=0.42,
+        reasons=["test_reason"],
+    )
+    market = make_market(
+        token_id_up="token-up",
+        token_id_down="token-down",
+        tick_size=0.01,
+        neg_risk=False,
+    )
+    base_service = make_service(
+        tmp_path / "paper_trades.jsonl",
+        market=market,
+        signal_engine=StubSignalEngine(decision),
+    )
+    executor = RecordingExecutor(
+        action="skip",
+        status="error",
+        message="live executor failed before order tracking",
+        order_id=None,
+    )
+    service = TradingService(
+        config=AppConfig(
+            trading_mode="live",
+            wallet_private_key="0xabc123",
+            signature_type=0,
+            funder_address="0x0000000000000000000000000000000000000001",
+            live_allow_market_ids=(market.market_id,),
+            live_max_order_usd=100.0,
+            paper_trades_path=base_service.config.paper_trades_path,
+        ),
+        binance=base_service.binance,
+        polymarket=base_service.polymarket,
+        chainlink=base_service.chainlink,
+        signal_engine=base_service.signal_engine,
+        risk_manager=base_service.risk_manager,
+        recorder=base_service.recorder,
+        executor=executor,
+    )
+
+    with caplog.at_level(logging.INFO, logger="pm_bot.cycle"):
+        result = service.oneshot(interval="5m", balance=1_000.0, live_confirmed=True)
+
+    assert result.action == "skip"
+    assert result.execution_status == "error"
+    records = _cycle_metric_records(caplog)
+    assert len(records) == 1
+    record = records[0]
+    assert record.event == "trading_cycle"
+    assert record.outcome == "error"
+    assert record.action == "skip"
+    assert record.execution_status == "error"
+    assert record.execution_message == "live executor failed before order tracking"
+    assert record.order_id is None
+    assert record.submission_id == "submission-123"
+    assert record.duration_ms >= 0.0
 
 
 def test_oneshot_builds_transport_friendly_execution_request_before_executor_call(tmp_path: Path):
@@ -141,7 +387,7 @@ def test_oneshot_builds_transport_friendly_execution_request_before_executor_cal
             signature_type=0,
             funder_address="0x0000000000000000000000000000000000000001",
             live_allow_market_ids=("btc-5m-1",),
-            live_max_order_usd=100.0,
+            live_max_order_usd=10.0,
             paper_trades_path=service.config.paper_trades_path,
         ),
         binance=service.binance,
@@ -156,13 +402,14 @@ def test_oneshot_builds_transport_friendly_execution_request_before_executor_cal
     result = service.oneshot(interval="5m", balance=1_000.0, live_confirmed=True)
 
     assert result.action == "live_trade"
+    assert result.submission_id == "submission-123"
     assert len(executor.requests) == 1
     request = executor.requests[0]
     assert request.market_id == "btc-5m-1"
     assert request.token_id == "token-down"
     assert request.side == "DOWN"
     assert request.price == 0.49
-    assert request.size_usd == 20.0
+    assert request.size_usd == 10.0
     assert request.order_type == "market"
     assert request.metadata["interval"] == "5m"
     assert request.metadata["tick_size"] == 0.01
@@ -403,7 +650,6 @@ def test_oneshot_blocks_live_execution_for_allowlist_size_and_metadata_gaps(tmp_
     assert result.action == "skip"
     assert result.reasons == [
         "live_market_not_allowlisted",
-        "live_order_size_exceeds_limit",
         "live_market_token_ids_incomplete",
         "live_token_id_missing",
         "live_neg_risk_missing",
@@ -411,7 +657,6 @@ def test_oneshot_blocks_live_execution_for_allowlist_size_and_metadata_gaps(tmp_
     assert result.execution_status == "blocked_live_order"
     assert result.execution_message == (
         "live_market_not_allowlisted,"
-        "live_order_size_exceeds_limit,"
         "live_market_token_ids_incomplete,"
         "live_token_id_missing,"
         "live_neg_risk_missing"
@@ -1103,18 +1348,20 @@ def test_oneshot_injected_executor_surfaces_status_without_paper_ledger_setup(tm
     assert len(executor.requests) == 1
 
 
-def test_oneshot_settles_due_losses_before_risk_checks_and_blocks_new_trade(tmp_path: Path):
+def test_oneshot_settles_due_losses_before_risk_checks_and_blocks_new_trade(tmp_path: Path, monkeypatch):
+    now = datetime(2026, 4, 19, 12, 0, tzinfo=UTC)
+    freeze_service_now(monkeypatch, now)
     paper_trades_path = tmp_path / "paper_trades.jsonl"
     paper_trades_path.write_text(
         json.dumps(
             {
-                "timestamp": "2026-04-18T00:00:00+00:00",
+                "timestamp": (now - timedelta(minutes=10)).isoformat(),
                 "market_id": "expired-loss",
                 "interval": "5m",
                 "side": "UP",
                 "price": 0.55,
                 "stake": 60.0,
-                "expires_at": "2026-04-18T00:05:00+00:00",
+                "expires_at": (now - timedelta(minutes=5)).isoformat(),
                 "reference_price": 100200.0,
                 "signal": {
                     "should_trade": True,
@@ -1181,22 +1428,24 @@ def test_oneshot_skips_malformed_or_legacy_paper_trade_lines_without_crashing(tm
     assert (expires_at - timestamp).total_seconds() == 240
 
 
-def test_oneshot_loads_already_settled_rows_for_risk_on_fresh_service(tmp_path: Path):
+def test_oneshot_loads_already_settled_rows_for_risk_on_fresh_service(tmp_path: Path, monkeypatch):
+    now = datetime(2026, 4, 19, 12, 0, tzinfo=UTC)
+    freeze_service_now(monkeypatch, now)
     paper_trades_path = tmp_path / "paper_trades.jsonl"
     paper_trades_path.write_text(
         "\n".join(
             [
                 json.dumps(
                     {
-                        "timestamp": "2026-04-18T00:00:00+00:00",
+                        "timestamp": (now - timedelta(minutes=16)).isoformat(),
                         "market_id": "settled-loss-1",
                         "interval": "5m",
                         "side": "UP",
                         "price": 0.55,
                         "stake": 30.0,
-                        "expires_at": "2026-04-18T00:05:00+00:00",
+                        "expires_at": (now - timedelta(minutes=11)).isoformat(),
                         "reference_price": 100200.0,
-                        "settled_at": "2026-04-18T00:06:00+00:00",
+                        "settled_at": (now - timedelta(minutes=10)).isoformat(),
                         "settlement_price": 100100.0,
                         "outcome": "loss",
                         "pnl": -30.0,
@@ -1204,15 +1453,15 @@ def test_oneshot_loads_already_settled_rows_for_risk_on_fresh_service(tmp_path: 
                 ),
                 json.dumps(
                     {
-                        "timestamp": "2026-04-18T00:10:00+00:00",
+                        "timestamp": (now - timedelta(minutes=8)).isoformat(),
                         "market_id": "settled-loss-2",
                         "interval": "5m",
                         "side": "DOWN",
                         "price": 0.45,
                         "stake": 25.0,
-                        "expires_at": "2026-04-18T00:15:00+00:00",
+                        "expires_at": (now - timedelta(minutes=3)).isoformat(),
                         "reference_price": 100000.0,
-                        "settled_at": "2026-04-18T00:16:00+00:00",
+                        "settled_at": (now - timedelta(minutes=2)).isoformat(),
                         "settlement_price": 100100.0,
                         "outcome": "loss",
                         "pnl": -25.0,

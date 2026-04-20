@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -63,6 +64,17 @@ class TradeRecommendation:
 
 @dataclass(slots=True)
 class PaperTradeRecord:
+    """Persisted paper-trade ledger row.
+
+    Paper trades still come from the normal signal pipeline, which is driven by
+    Binance market data. The stored ``reference_price`` is the Chainlink-style
+    resolution threshold captured at entry, and a later settlement pass compares
+    that fixed reference against a surrogate BTC ``settlement_price`` (normally
+    sampled from Binance at expiry) to simulate how the market would resolve.
+    When ``settlement_price == reference_price``, paper settlement resolves to
+    ``UP``.
+    """
+
     timestamp: str
     market_id: str
     interval: str
@@ -81,4 +93,27 @@ class PaperTradeRecord:
     def to_dict(self) -> dict:
         payload = asdict(self)
         payload["signal"] = asdict(self.signal)
+        return {key: value for key, value in payload.items() if value is not None}
+
+
+@dataclass(slots=True)
+class LiveOrderRecord:
+    """Persisted live-order journal row."""
+
+    timestamp: str
+    market_id: str
+    token_id: str | None
+    side: str
+    submitted_price: float
+    submitted_size: float
+    status: str
+    submission_id: str
+    order_hash: str | None = None
+    order_id: str | None = None
+    message: str | None = None
+    signed_order_payload: dict[str, Any] | None = None
+    signed_order_fingerprint: str | None = None
+
+    def to_dict(self) -> dict:
+        payload = asdict(self)
         return {key: value for key, value in payload.items() if value is not None}

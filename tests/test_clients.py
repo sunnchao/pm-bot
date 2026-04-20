@@ -1,7 +1,8 @@
-import pytest
-
+import urllib.error
 from datetime import UTC, datetime
 from pathlib import Path
+
+import pytest
 
 from pm_bot.clients import BinanceMarketDataClient, PolymarketMarketClient, load_fixture_clients
 
@@ -14,6 +15,39 @@ def test_binance_latest_price_rejects_non_mapping_payload(monkeypatch):
     with pytest.raises(ValueError, match="unexpected Binance ticker payload"):
         client.latest_price()
 
+
+
+
+def test_binance_latest_price_retries_transient_url_errors(monkeypatch):
+    attempts = {"count": 0}
+    sleep_calls: list[float] = []
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self) -> bytes:
+            return b'{"price": "100025.00"}'
+
+    def flaky_urlopen(request, timeout):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise urllib.error.URLError("temporary outage")
+        return FakeResponse()
+
+    monkeypatch.setattr("pm_bot.retry.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr("pm_bot.clients.urlopen", flaky_urlopen)
+
+    client = BinanceMarketDataClient(base_url="https://example.com")
+
+    tick = client.latest_price()
+
+    assert tick.price == 100025.0
+    assert attempts["count"] == 3
+    assert sleep_calls == [0.1, 0.2]
 
 def test_polymarket_active_markets_rejects_non_list_payload(monkeypatch):
     monkeypatch.setattr("pm_bot.clients._get_json", lambda url: {"markets": []})
