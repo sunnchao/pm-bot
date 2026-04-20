@@ -1,15 +1,15 @@
 from __future__ import annotations
 
 import json
-import math
 import os
-from contextlib import contextmanager
 from collections.abc import Callable
+from contextlib import contextmanager
 from datetime import datetime
 from fcntl import LOCK_EX, LOCK_UN, flock
 from pathlib import Path
 
 from pm_bot.models import PaperTradeRecord
+from pm_bot.money import parse_decimal, quantize_usd, to_float
 
 
 class PaperTradeRecorder:
@@ -35,14 +35,14 @@ class PaperTradeRecorder:
                     continue
 
                 closed_at = _closed_at_for_risk(payload)
-                pnl = _parse_float(payload.get("pnl"))
+                pnl = _parse_decimal(payload.get("pnl"))
                 if closed_at is None or pnl is None:
                     continue
 
                 trades.append(
                     {
                         "market_id": str(payload.get("market_id", "")),
-                        "pnl": pnl,
+                        "pnl": to_float(pnl),
                         "closed_at": closed_at,
                     }
                 )
@@ -55,6 +55,16 @@ class PaperTradeRecorder:
         now: datetime,
         settlement_price_at: Callable[[datetime], float | None] | None = None,
     ) -> list[dict]:
+        """Settle expired paper trades against their recorded reference price.
+
+        ``reference_price`` remains the fixed Chainlink/Polymarket threshold that
+        was recorded when the paper trade was opened. ``settlement_price_at``
+        supplies the surrogate BTC price used to simulate resolution in paper
+        mode (normally Binance price-at-expiry), while ``current_btc_price`` is a
+        fallback when no historical lookup is provided. Equality resolves to
+        ``UP`` when ``settlement_price == reference_price``.
+        """
+
         with self._locked_ledger():
             if not self.path.exists():
                 return []
@@ -123,13 +133,15 @@ def _settle_payload(
     now: datetime,
     settlement_price_at: Callable[[datetime], float | None] | None = None,
 ) -> dict | None:
+    """Simulate Chainlink-style settlement for a persisted paper trade."""
+
     if payload.get("settled_at"):
         return None
 
     expires_at = _parse_iso_datetime(payload.get("expires_at"))
-    reference_price = _parse_float(payload.get("reference_price"))
-    entry_price = _parse_float(payload.get("price"))
-    stake = _parse_float(payload.get("stake"))
+    reference_price = _parse_decimal(payload.get("reference_price"))
+    entry_price = _parse_decimal(payload.get("price"))
+    stake = _parse_decimal(payload.get("stake"))
     side = payload.get("side")
 
     if expires_at is None or reference_price is None or entry_price is None or stake is None:
@@ -141,28 +153,31 @@ def _settle_payload(
     if stake < 0 or not 0 < entry_price < 1:
         return None
 
-    settlement_price = current_btc_price
+    settlement_price = _parse_decimal(current_btc_price)
+    if settlement_price is None:
+        return None
     if settlement_price_at is not None:
-        settlement_price = settlement_price_at(expires_at)
+        settlement_price = _parse_decimal(settlement_price_at(expires_at))
         if settlement_price is None:
             return None
 
-    if settlement_price == reference_price:
+    # Paper mode does not query an actual on-chain settlement event here.
+    # Instead, it simulates the contract resolution by comparing the recorded
+    # reference price to a surrogate BTC price for expiry time. Ties resolve to
+    # UP when settlement_price == reference_price.
+    winning_side = "UP" if settlement_price >= reference_price else "DOWN"
+    if side == winning_side:
+        pnl = quantize_usd((stake / entry_price) - stake)
         return {
-            "outcome": "void",
-            "pnl": 0.0,
-            "settlement_price": settlement_price,
+            "outcome": "win",
+            "pnl": to_float(pnl),
+            "settlement_price": to_float(settlement_price),
             "closed_at": expires_at,
         }
-
-    winning_side = "UP" if settlement_price > reference_price else "DOWN"
-    if side == winning_side:
-        pnl = round((stake / entry_price) - stake, 2)
-        return {"outcome": "win", "pnl": pnl, "settlement_price": settlement_price, "closed_at": expires_at}
     return {
         "outcome": "loss",
-        "pnl": round(-stake, 2),
-        "settlement_price": settlement_price,
+        "pnl": to_float(quantize_usd(-stake)),
+        "settlement_price": to_float(settlement_price),
         "closed_at": expires_at,
     }
 
@@ -179,14 +194,8 @@ def _parse_iso_datetime(value: object) -> datetime | None:
     return parsed
 
 
-def _parse_float(value: object) -> float | None:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(parsed):
-        return None
-    return parsed
+def _parse_decimal(value: object):
+    return parse_decimal(value)
 
 
 def _load_payload(raw_line: str) -> dict | None:

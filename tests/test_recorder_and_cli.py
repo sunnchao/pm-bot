@@ -11,6 +11,7 @@ from pm_bot.cli import build_parser, main
 from pm_bot.config import AppConfig
 from pm_bot.models import PaperTradeRecord, SignalDecision
 from pm_bot.recorder import PaperTradeRecorder
+from pm_bot.service import OneShotResult
 
 
 def test_recorder_appends_jsonl(tmp_path: Path):
@@ -43,7 +44,7 @@ def test_recorder_appends_jsonl(tmp_path: Path):
     assert payload["signal"]["signal_name"] == "momentum"
 
 
-def test_recorder_settles_due_trades_with_win_loss_and_void_outcomes(tmp_path: Path):
+def test_recorder_settles_due_trades_with_win_loss_and_equal_up_win_outcomes(tmp_path: Path):
     recorder = PaperTradeRecorder(tmp_path / "paper_trades.jsonl")
     signal = SignalDecision(
         should_trade=True,
@@ -81,7 +82,7 @@ def test_recorder_settles_due_trades_with_win_loss_and_void_outcomes(tmp_path: P
     recorder.record(
         PaperTradeRecord(
             timestamp="2026-04-18T00:00:00+00:00",
-            market_id="void-flat",
+            market_id="equal-up",
             interval="5m",
             side="UP",
             price=0.6,
@@ -94,13 +95,13 @@ def test_recorder_settles_due_trades_with_win_loss_and_void_outcomes(tmp_path: P
 
     settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
 
-    assert [item["market_id"] for item in settlements] == ["win-up", "loss-down", "void-flat"]
+    assert [item["market_id"] for item in settlements] == ["win-up", "loss-down", "equal-up"]
     assert settlements[0]["outcome"] == "win"
     assert settlements[0]["pnl"] == 30.0
     assert settlements[1]["outcome"] == "loss"
     assert settlements[1]["pnl"] == -20.0
-    assert settlements[2]["outcome"] == "void"
-    assert settlements[2]["pnl"] == 0.0
+    assert settlements[2]["outcome"] == "win"
+    assert settlements[2]["pnl"] == 13.33
 
     persisted = [
         json.loads(line)
@@ -109,7 +110,8 @@ def test_recorder_settles_due_trades_with_win_loss_and_void_outcomes(tmp_path: P
     assert persisted[0]["settlement_price"] == 100100.0
     assert persisted[0]["settled_at"] == "2026-04-18T00:06:00+00:00"
     assert persisted[1]["outcome"] == "loss"
-    assert persisted[2]["pnl"] == 0.0
+    assert persisted[2]["outcome"] == "win"
+    assert persisted[2]["pnl"] == 13.33
 
 
 def test_recorder_settle_due_uses_expiry_as_closed_at_for_risk_windows(tmp_path: Path):
@@ -137,6 +139,42 @@ def test_recorder_settle_due_uses_expiry_as_closed_at_for_risk_windows(tmp_path:
     settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
 
     assert settlements[0]["closed_at"] == datetime(2026, 4, 18, 0, 5, tzinfo=UTC)
+
+
+def test_recorder_settle_due_quantizes_half_cent_wins_with_decimal(tmp_path: Path):
+    recorder = PaperTradeRecorder(tmp_path / "paper_trades.jsonl")
+    recorder.record(
+        PaperTradeRecord(
+            timestamp="2026-04-18T00:00:00+00:00",
+            market_id="decimal-win",
+            interval="5m",
+            side="UP",
+            price=0.4,
+            stake=20.01,
+            expires_at="2026-04-18T00:05:00+00:00",
+            reference_price=100000.0,
+            signal=SignalDecision(
+                should_trade=True,
+                side="UP",
+                signal_name="momentum",
+                confidence=0.7,
+                reasons=["trend"],
+            ),
+        )
+    )
+
+    settlements = recorder.settle_due(current_btc_price=100100.0, now=datetime(2026, 4, 18, 0, 6, tzinfo=UTC))
+
+    assert settlements == [
+        {
+            "market_id": "decimal-win",
+            "outcome": "win",
+            "pnl": 30.02,
+            "closed_at": datetime(2026, 4, 18, 0, 5, tzinfo=UTC),
+        }
+    ]
+    persisted = json.loads((tmp_path / "paper_trades.jsonl").read_text(encoding="utf-8").strip())
+    assert persisted["pnl"] == 30.02
 
 
 def test_recorder_hydrates_closed_trades_from_expiry_instead_of_settled_at(tmp_path: Path):
@@ -428,17 +466,26 @@ def test_app_config_from_env_rejects_non_positive_min_seconds(monkeypatch):
         AppConfig.from_env()
 
 
-def test_cli_supports_oneshot_and_loop():
+def test_cli_supports_oneshot_loop_and_live_commands():
     parser = build_parser()
 
     oneshot = parser.parse_args(["oneshot", "--interval", "5m"])
     loop = parser.parse_args(["loop", "--interval", "15m", "--sleep-seconds", "60"])
+    live = parser.parse_args(["live", "--interval", "5m", "--confirm-live"])
+    live_loop = parser.parse_args(["live-loop", "--interval", "15m", "--sleep-seconds", "60", "--confirm-live"])
 
     assert oneshot.command == "oneshot"
     assert oneshot.interval == "5m"
     assert loop.command == "loop"
     assert loop.interval == "15m"
     assert loop.sleep_seconds == 60
+    assert live.command == "live"
+    assert live.interval == "5m"
+    assert live.confirm_live is True
+    assert live_loop.command == "live-loop"
+    assert live_loop.interval == "15m"
+    assert live_loop.sleep_seconds == 60
+    assert live_loop.confirm_live is True
 
 
 def test_cli_supports_discover_and_fixture():
@@ -455,6 +502,9 @@ def test_cli_supports_discover_and_fixture():
 
 def test_discover_prints_json(monkeypatch, capsys):
     class StubService:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
         def discover(self, keywords: list[str], limit: int) -> list[dict]:
             assert keywords == ["btc", "bitcoin"]
             assert limit == 2
@@ -568,6 +618,319 @@ def test_cli_rejects_non_numeric_arguments(monkeypatch, capsys, argv: list[str],
     output = json.loads(capsys.readouterr().out)
     assert output["action"] == "error"
     assert message_fragment in output["error"]
+
+
+
+def test_live_command_rejects_missing_confirmation(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["pm-bot", "live", "--interval", "5m"])
+
+    exit_code = main()
+
+    assert exit_code == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["action"] == "error"
+    assert output["error"] == "--confirm-live is required for live trading"
+
+
+
+def test_live_command_validates_required_wallet_config_before_building_live_path(monkeypatch, capsys):
+    monkeypatch.setattr(
+        "pm_bot.cli.AppConfig.from_env",
+        classmethod(
+            lambda cls: AppConfig(
+                trading_mode="live",
+                live_allow_market_ids=("btc-5m-1",),
+                live_max_order_usd=100.0,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        "pm_bot.cli.LiveOrderRecorder",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("live recorder should not be constructed")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["pm-bot", "live", "--interval", "5m", "--confirm-live"],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output["action"] == "error"
+    assert output["error"] == "live wallet config incomplete"
+
+
+
+def test_live_command_builds_live_service_executor_path(monkeypatch, tmp_path: Path, capsys):
+    config = AppConfig(
+        trading_mode="live",
+        wallet_private_key="0xabc123",
+        signature_type=0,
+        funder_address="0x0000000000000000000000000000000000000001",
+        live_allow_market_ids=("btc-5m-1",),
+        live_max_order_usd=100.0,
+        live_orders_path=tmp_path / "runtime" / "live_orders.jsonl",
+    )
+    created: dict[str, object] = {}
+
+    class StubLiveOrderRecorder:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            created["recorder"] = self
+
+    class StubLivePolymarketExecutor:
+        def __init__(self, config: AppConfig | None = None, client=None, recorder=None) -> None:
+            assert config is not None
+            assert recorder is created["recorder"]
+            self.config = config
+            self.client = client
+            self.recorder = recorder
+            created["executor"] = self
+
+        def get_order(self, order_id: str):
+            raise AssertionError("live reconciliation should not run in this CLI wiring test")
+
+    class StubLiveTradingService:
+        def __init__(self, *args, config: AppConfig | None = None, executor=None, live_recorder=None, **kwargs) -> None:
+            assert config is not None
+            assert executor is created["executor"]
+            assert live_recorder is created["recorder"]
+            assert executor.recorder is live_recorder
+            created["service"] = self
+
+        def oneshot(self, interval: str, balance: float = 1_000.0, *, live_confirmed: bool = False):
+            created["oneshot_call"] = {
+                "interval": interval,
+                "balance": balance,
+                "live_confirmed": live_confirmed,
+            }
+            return OneShotResult(
+                interval=interval,
+                market_id="btc-5m-1",
+                action="live_trade",
+                reasons=[],
+                execution_status="accepted",
+                execution_message="accepted",
+                order_id="order-123",
+                submission_id="submission-123",
+            )
+
+    monkeypatch.setattr("pm_bot.cli.AppConfig.from_env", classmethod(lambda cls: config))
+    monkeypatch.setattr(
+        "pm_bot.cli.TradingService",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("paper service should not be constructed")),
+    )
+    monkeypatch.setattr("pm_bot.cli.LiveOrderRecorder", StubLiveOrderRecorder)
+    monkeypatch.setattr("pm_bot.cli.LivePolymarketExecutor", StubLivePolymarketExecutor)
+    monkeypatch.setattr("pm_bot.cli.LiveTradingService", StubLiveTradingService)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["pm-bot", "live", "--interval", "5m", "--balance", "250", "--confirm-live"],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    output = json.loads(capsys.readouterr().out)
+    assert output["action"] == "live_trade"
+    assert created["oneshot_call"] == {"interval": "5m", "balance": 250.0, "live_confirmed": True}
+    recorder = created["recorder"]
+    assert isinstance(recorder, StubLiveOrderRecorder)
+    assert recorder.path == config.live_orders_path
+
+
+
+def test_live_loop_reuses_same_live_path_and_stops_after_requested_iterations(monkeypatch, tmp_path: Path, capsys):
+    config = AppConfig(
+        trading_mode="live",
+        wallet_private_key="0xabc123",
+        signature_type=0,
+        funder_address="0x0000000000000000000000000000000000000001",
+        live_allow_market_ids=("btc-15m-1",),
+        live_max_order_usd=100.0,
+        live_orders_path=tmp_path / "runtime" / "live_orders.jsonl",
+    )
+    created_recorders: list[object] = []
+    sleep_calls: list[int] = []
+
+    class StubLiveOrderRecorder:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+            created_recorders.append(self)
+
+    class StubLivePolymarketExecutor:
+        def __init__(self, config: AppConfig | None = None, client=None, recorder=None) -> None:
+            self.config = config
+            self.client = client
+            self.recorder = recorder
+
+        def get_order(self, order_id: str):
+            raise AssertionError("live reconciliation should not run in this CLI loop test")
+
+    class StubLiveTradingService:
+        instances: list["StubLiveTradingService"] = []
+
+        def __init__(self, *args, config: AppConfig | None = None, executor=None, live_recorder=None, **kwargs) -> None:
+            assert config is not None
+            assert executor is not None
+            assert live_recorder is not None
+            assert executor.recorder is live_recorder
+            self.calls: list[dict[str, object]] = []
+            self.live_recorder = live_recorder
+            StubLiveTradingService.instances.append(self)
+
+        def oneshot(self, interval: str, balance: float = 1_000.0, *, live_confirmed: bool = False):
+            self.calls.append(
+                {
+                    "interval": interval,
+                    "balance": balance,
+                    "live_confirmed": live_confirmed,
+                    "path": self.live_recorder.path,
+                }
+            )
+            iteration = len(self.calls)
+            return OneShotResult(
+                interval=interval,
+                market_id=f"btc-15m-{iteration}",
+                action="live_trade",
+                reasons=[],
+                execution_status="accepted",
+                execution_message=f"accepted-{iteration}",
+                order_id=f"order-{iteration}",
+                submission_id=f"submission-{iteration}",
+            )
+
+    monkeypatch.setattr("pm_bot.cli.AppConfig.from_env", classmethod(lambda cls: config))
+    monkeypatch.setattr("pm_bot.cli.LiveOrderRecorder", StubLiveOrderRecorder)
+    monkeypatch.setattr("pm_bot.cli.LivePolymarketExecutor", StubLivePolymarketExecutor)
+    monkeypatch.setattr("pm_bot.cli.LiveTradingService", StubLiveTradingService)
+    monkeypatch.setattr("pm_bot.cli.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pm-bot",
+            "live-loop",
+            "--interval",
+            "15m",
+            "--balance",
+            "250",
+            "--sleep-seconds",
+            "7",
+            "--iterations",
+            "2",
+            "--confirm-live",
+        ],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert len(created_recorders) == 1
+    assert len(StubLiveTradingService.instances) == 1
+    service = StubLiveTradingService.instances[0]
+    assert service.calls == [
+        {
+            "interval": "15m",
+            "balance": 250.0,
+            "live_confirmed": True,
+            "path": config.live_orders_path,
+        },
+        {
+            "interval": "15m",
+            "balance": 250.0,
+            "live_confirmed": True,
+            "path": config.live_orders_path,
+        },
+    ]
+    assert sleep_calls == [7]
+    output_lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert [line["submission_id"] for line in output_lines] == ["submission-1", "submission-2"]
+
+
+def test_live_command_returns_structured_json_for_runtime_failures(monkeypatch, capsys):
+    class StubLiveTradingService:
+        def oneshot(self, interval: str, balance: float = 1_000.0, *, live_confirmed: bool = False):
+            raise RuntimeError("live venue unavailable")
+
+    monkeypatch.setattr("pm_bot.cli._build_live_service", lambda: StubLiveTradingService())
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["pm-bot", "live", "--interval", "5m", "--confirm-live"],
+    )
+
+    exit_code = main()
+
+    assert exit_code == 1
+    output = json.loads(capsys.readouterr().out)
+    assert output == {"action": "error", "error": "live venue unavailable"}
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["pm-bot", "oneshot", "--interval", "5m"],
+        ["pm-bot", "loop", "--interval", "5m", "--iterations", "1"],
+    ],
+)
+def test_paper_commands_stay_paper_safe_when_env_requests_live(monkeypatch, tmp_path: Path, capsys, argv: list[str]):
+    paper_config = AppConfig(trading_mode="paper", paper_trades_path=tmp_path / "paper_trades.jsonl")
+    built_configs: list[AppConfig] = []
+
+    class StubTradingService:
+        def __init__(self, config: AppConfig | None = None, *args, **kwargs) -> None:
+            self.config = config or AppConfig.from_env()
+            built_configs.append(self.config)
+
+        def oneshot(self, interval: str, balance: float = 1_000.0, *, live_confirmed: bool = False):
+            assert self.config.trading_mode == "paper"
+            assert live_confirmed is False
+            return OneShotResult(
+                interval=interval,
+                market_id="paper-btc-5m",
+                action="paper_trade",
+                reasons=[],
+            )
+
+    monkeypatch.setenv("TRADING_MODE", "live")
+    monkeypatch.setenv("WALLET_PRIVATE_KEY", "0xabc123")
+    monkeypatch.setenv("SIGNATURE_TYPE", "0")
+    monkeypatch.setenv("FUNDER_ADDRESS", "0x0000000000000000000000000000000000000001")
+    monkeypatch.setattr("pm_bot.cli.AppConfig.paper_from_env", classmethod(lambda cls: paper_config))
+    monkeypatch.setattr(
+        "pm_bot.cli.AppConfig.from_env",
+        classmethod(
+            lambda cls: (_ for _ in ()).throw(AssertionError("paper commands must not load live config"))
+        ),
+    )
+    monkeypatch.setattr("pm_bot.cli.TradingService", StubTradingService)
+    monkeypatch.setattr(sys, "argv", argv)
+
+    exit_code = main()
+
+    assert exit_code == 0
+    assert built_configs == [paper_config]
+    output_lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert output_lines == [
+        {
+            "interval": "5m",
+            "market_id": "paper-btc-5m",
+            "action": "paper_trade",
+            "reasons": [],
+            "signal_name": None,
+            "confidence": 0.0,
+            "side": None,
+            "stake": 0.0,
+            "execution_status": None,
+            "execution_message": None,
+            "order_id": None,
+            "submission_id": None,
+        }
+    ]
 
 
 def test_oneshot_fixture_runs_full_pipeline(monkeypatch, tmp_path: Path, capsys):
